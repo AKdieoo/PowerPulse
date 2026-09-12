@@ -60,14 +60,18 @@ how the real data was sourced and transformed.
 
 ```
 powerpulse/
-├── app.R                 # Shiny dashboard (UI + server)
+├── app.R                        # Shiny dashboard (UI + server)
 ├── R/
-│   ├── generate_data.R   # creates a synthetic sample dataset (optional)
-│   ├── load_uci_data.R   # converts the real UCI dataset into PowerPulse's format
-│   └── pipeline.R        # cleaning, profiling, baseline, detection, scoring
-│                         # (hourly + daily + weekly resolutions)
+│   ├── generate_data.R          # creates a synthetic sample dataset (optional)
+│   ├── load_uci_data.R          # converts the real UCI dataset into PowerPulse's format
+│   └── pipeline.R               # cleaning, profiling, baseline, detection, scoring
+│                                 # (hourly + daily + weekly resolutions)
 ├── data/
-│   └── energy_data.csv   # the real, processed hourly dataset used by the app
+│   └── energy_data.csv          # the real, processed hourly dataset used by the app
+├── screenshots/
+│   ├── dashboard-overview.png
+│   ├── trend-anomalies.png
+│   └── anomaly-detail.png
 └── README.md
 ```
 
