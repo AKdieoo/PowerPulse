@@ -11,6 +11,19 @@ Energy Dataset → Data Cleaning → Consumption Profiling → Time-Series Analy
 → Interactive Dashboard
 ```
 
+## Screenshots
+
+**Dashboard overview** — KPI cards, actual-vs-expected chart, and the
+detected anomalies table for a real household circuit (Water Heater & AC,
+from the UCI dataset above):
+
+![Dashboard overview](screenshots/dashboard-overview.png)
+
+**Anomaly detail panel** — clicking a row surfaces the severity score and
+the statistical "likely causes":
+
+![Anomaly detail](screenshots/anomaly-detail.png)
+
 ## Data source
 
 This project is built and validated against **real electricity consumption
