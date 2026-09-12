@@ -2,7 +2,10 @@
 # PowerPulse -- Electricity Consumption Anomaly Intelligence
 # =============================================================================
 # A Shiny dashboard that goes beyond "predict electricity demand" and instead
-# answers: "why is today's consumption abnormal?"
+# answers: "why is today's consumption abnormal?" -- at THREE resolutions:
+#   - Hourly  -> operational spikes/drops (dynamic per-hour baseline)
+#   - Daily   -> "this Tuesday was 2.3sigma above normal Tuesdays"
+#   - Weekly  -> trend-level drift vs. this building's own weekly history
 #
 # HOW TO RUN
 # -----------------------------------------------------------------------------
@@ -23,6 +26,8 @@ library(bslib)
 library(dplyr)
 library(tidyr)
 library(lubridate)
+library(purrr)
+library(stringr)
 library(ggplot2)
 library(plotly)
 library(DT)
@@ -39,10 +44,16 @@ if (!file.exists(DATA_PATH)) {
 
 raw_data <- read_csv(DATA_PATH, show_col_types = FALSE)
 
-# Run the whole analytics pipeline ONCE at app startup. It's cheap enough
-# (thousands of rows) to keep entirely in memory and filter reactively.
+# Clean once, reuse everywhere (hourly pipeline, profiling, daily/weekly).
+cleaned_data <- clean_energy_data(raw_data)
+
+# Run the whole HOURLY analytics pipeline ONCE at app startup. It's cheap
+# enough (thousands of rows) to keep entirely in memory and filter reactively.
 scored_data <- run_pipeline(raw_data)
-profiles    <- profile_consumption(clean_energy_data(raw_data))
+profiles    <- profile_consumption(cleaned_data)
+
+# Daily/weekly detectors are re-run reactively (see live_daily/live_weekly)
+# so the same sensitivity sliders drive all three resolutions consistently.
 
 severity_colors <- c(
   "Normal"   = "#4CAF50",
@@ -55,6 +66,7 @@ severity_colors <- c(
 # UI
 # =============================================================================
 ui <- page_sidebar(
+  fillable = FALSE,
   title = tagList(
     span(style = "font-weight:800; letter-spacing:0.5px;", "\u26A1 POWERPULSE"),
     span(style = "font-weight:400; font-size:0.75em; color:#888; margin-left:8px;",
@@ -80,13 +92,16 @@ ui <- page_sidebar(
     sliderInput("dev_thresh", "% deviation sensitivity", min = 10, max = 60, value = 30, step = 5),
     hr(),
     helpText("Lower sensitivity values flag more anomalies. Defaults match the ",
-             "statistical thresholds used in the write-up (z \u2265 2, deviation \u2265 30%)."),
+             "statistical thresholds used in the write-up (z \u2265 2, deviation \u2265 30%). ",
+             "These sliders drive all three resolutions below: hourly, daily, and weekly."),
     hr(),
-    h6("About the baseline"),
+    h6("About the baselines"),
     p(style = "font-size:0.8em; color:#999;",
-      "Expected consumption is computed per building, per hour-of-day, and per ",
-      "day-type (weekday vs weekend) -- not a single flat threshold. A Saturday ",
-      "8 AM anomaly is judged against other Saturdays, not against Mondays.")
+      "Hourly expected consumption is computed per building, per hour-of-day, and per ",
+      "day-type (weekday vs weekend). Daily expected totals are computed per building, ",
+      "day-type, and season (a summer Tuesday is judged against other summer Tuesdays). ",
+      "Weekly expected totals are each building's own leave-one-week-out history. ",
+      "None of these use a single flat threshold.")
   ),
 
   # ---- Top row: KPI value boxes --------------------------------------------
@@ -99,7 +114,7 @@ ui <- page_sidebar(
       theme = "primary"
     ),
     value_box(
-      title = "Anomalies Detected",
+      title = "Hourly Anomalies Today",
       value = textOutput("kpi_anomalies", inline = TRUE),
       showcase = bsicons::bs_icon("exclamation-triangle-fill"),
       theme = "danger"
@@ -118,10 +133,27 @@ ui <- page_sidebar(
     )
   ),
 
+  # ---- Second row: multi-resolution KPI value boxes -------------------------
+  layout_columns(
+    fill = FALSE,
+    value_box(
+      title = "Anomalous Days (all-time)",
+      value = textOutput("kpi_daily_anomalies", inline = TRUE),
+      showcase = bsicons::bs_icon("calendar-week-fill"),
+      theme = "danger"
+    ),
+    value_box(
+      title = "Anomalous Weeks (all-time)",
+      value = textOutput("kpi_weekly_anomalies", inline = TRUE),
+      showcase = bsicons::bs_icon("calendar3-range-fill"),
+      theme = "warning"
+    )
+  ),
+
   # ---- Middle: actual vs expected chart -------------------------------------
   card(
     full_screen = TRUE,
-    card_header("Actual vs Expected Consumption"),
+    card_header("Actual vs Expected Consumption (Hourly)"),
     plotlyOutput("main_chart", height = "380px")
   ),
 
@@ -130,7 +162,7 @@ ui <- page_sidebar(
 
     # ---- Detected anomalies table -----------------------------------------
     card(
-      card_header("Detected Anomalies"),
+      card_header("Detected Anomalies (Hourly)"),
       DTOutput("anomaly_table")
     ),
 
@@ -138,6 +170,33 @@ ui <- page_sidebar(
     card(
       card_header("Anomaly Detail"),
       uiOutput("detail_panel")
+    )
+  ),
+
+  # ---- NEW: Daily & Weekly anomaly detection --------------------------------
+  card(
+    full_screen = TRUE,
+    card_header("Trend-Level Anomaly Detection (Daily & Weekly)"),
+    tabsetPanel(
+      id = "trend_tabs",
+      tabPanel(
+        "Daily",
+        br(),
+        p(style = "font-size:0.85em; color:#999;",
+          "Each day's total kWh is compared against this building's own history for that ",
+          "day-type and season (leave-one-day-out), e.g. \"this Tuesday's total was 2.3\u03c3 ",
+          "above normal summer Tuesdays.\" Only flagged days are shown."),
+        DTOutput("daily_table")
+      ),
+      tabPanel(
+        "Weekly",
+        br(),
+        p(style = "font-size:0.85em; color:#999;",
+          "Each ISO week's total kWh is compared against this building's own leave-one-week-out ",
+          "history, surfacing slower trend-level drift that hourly/daily checks can miss. ",
+          "Only flagged weeks are shown."),
+        DTOutput("weekly_table")
+      )
     )
   ),
 
@@ -164,14 +223,23 @@ ui <- page_sidebar(
 # =============================================================================
 server <- function(input, output, session) {
 
-  # Re-run detection with user-adjustable sensitivity sliders, but reuse the
-  # already-cleaned/baselined data so this stays fast.
+  # ---- HOURLY: re-run detection with user-adjustable sensitivity sliders ---
+  # Reuses the already-cleaned/baselined data so this stays fast.
   live_scored <- reactive({
     scored_data %>%
       select(-z_flag, -iqr_flag, -dev_flag, -is_anomaly, -anomaly_type,
              -anomaly_score, -severity_band, -is_repeated, -prior_anomaly_rate) %>%
       detect_anomalies(z_thresh = input$z_thresh, dev_thresh = input$dev_thresh) %>%
       score_severity()
+  })
+
+  # ---- DAILY & WEEKLY: same sliders drive these two resolutions too --------
+  live_daily <- reactive({
+    detect_daily_anomalies(cleaned_data, z_thresh = input$z_thresh, dev_thresh = input$dev_thresh)
+  })
+
+  live_weekly <- reactive({
+    detect_weekly_anomalies(cleaned_data, z_thresh = input$z_thresh, dev_thresh = input$dev_thresh)
   })
 
   day_data <- reactive({
@@ -184,6 +252,20 @@ server <- function(input, output, session) {
   building_history <- reactive({
     req(input$building)
     live_scored() %>% filter(building_id == input$building)
+  })
+
+  building_daily <- reactive({
+    req(input$building)
+    live_daily() %>%
+      filter(building_id == input$building) %>%
+      arrange(desc(date))
+  })
+
+  building_weekly <- reactive({
+    req(input$building)
+    live_weekly() %>%
+      filter(building_id == input$building) %>%
+      arrange(desc(week_start))
   })
 
   # baseline "normal" daily total for this building (median of daily totals)
@@ -217,6 +299,14 @@ server <- function(input, output, session) {
     normal <- normal_daily_total()
     pct <- 100 * (today_total - normal) / normal
     sprintf("%+.1f%%", pct)
+  })
+
+  output$kpi_daily_anomalies <- renderText({
+    as.character(sum(building_daily()$is_anomaly))
+  })
+
+  output$kpi_weekly_anomalies <- renderText({
+    as.character(sum(building_weekly()$is_anomaly))
   })
 
   # ---- Main chart: actual vs expected, anomalies highlighted -----------------
@@ -257,7 +347,7 @@ server <- function(input, output, session) {
     p
   })
 
-  # ---- Anomaly table -----------------------------------------------------
+  # ---- Anomaly table (hourly) -----------------------------------------------
   type_icon <- c(
     night_spike      = "\U0001F319 Night Spike",
     morning_spike    = "\U0001F525 Morning Spike",
@@ -338,6 +428,82 @@ server <- function(input, output, session) {
       h6("Likely causes"),
       tags$ul(lapply(reasons, tags$li))
     )
+  })
+
+  # ---- NEW: Daily anomaly table ---------------------------------------------
+  daily_table_data <- reactive({
+    d <- building_daily() %>% filter(is_anomaly)
+    validate(need(nrow(d) > 0,
+                  "No daily-level anomalies detected for this building at the current sensitivity."))
+
+    explanations <- purrr::pmap_chr(d, function(...) explain_daily_anomaly(list(...)))
+
+    d %>%
+      mutate(Explanation = explanations) %>%
+      arrange(desc(anomaly_score), desc(date)) %>%
+      transmute(
+        Date        = format(date, "%Y-%m-%d"),
+        Day         = as.character(wday_label),
+        Season      = season,
+        `Total kWh` = sprintf("%.0f", total_kwh),
+        Deviation   = sprintf("%+.0f%%", deviation_pct),
+        `Z-score`   = sprintf("%.2f\u03C3", z_score),
+        Score       = anomaly_score,
+        Severity    = severity_band,
+        Explanation = Explanation
+      )
+  })
+
+  output$daily_table <- renderDT({
+    d <- daily_table_data()
+    datatable(
+      d,
+      rownames = FALSE,
+      options = list(pageLength = 8, scrollX = TRUE),
+      class = "compact stripe"
+    ) %>%
+      formatStyle(
+        "Severity",
+        target = "row",
+        backgroundColor = styleEqual(names(severity_colors), paste0(unname(severity_colors), "22"))
+      )
+  })
+
+  # ---- NEW: Weekly anomaly table ---------------------------------------------
+  weekly_table_data <- reactive({
+    d <- building_weekly() %>% filter(is_anomaly)
+    validate(need(nrow(d) > 0,
+                  "No weekly-level anomalies detected for this building at the current sensitivity."))
+
+    explanations <- purrr::pmap_chr(d, function(...) explain_weekly_anomaly(list(...)))
+
+    d %>%
+      mutate(Explanation = explanations) %>%
+      arrange(desc(anomaly_score), desc(week_start)) %>%
+      transmute(
+        `Week of`   = format(week_start, "%Y-%m-%d"),
+        `Total kWh` = sprintf("%.0f", total_kwh),
+        Deviation   = sprintf("%+.0f%%", deviation_pct),
+        `Z-score`   = sprintf("%.2f\u03C3", z_score),
+        Score       = anomaly_score,
+        Severity    = severity_band,
+        Explanation = Explanation
+      )
+  })
+
+  output$weekly_table <- renderDT({
+    d <- weekly_table_data()
+    datatable(
+      d,
+      rownames = FALSE,
+      options = list(pageLength = 8, scrollX = TRUE),
+      class = "compact stripe"
+    ) %>%
+      formatStyle(
+        "Severity",
+        target = "row",
+        backgroundColor = styleEqual(names(severity_colors), paste0(unname(severity_colors), "22"))
+      )
   })
 
   # ---- Profiling plots -------------------------------------------------------

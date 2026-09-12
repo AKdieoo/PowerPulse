@@ -195,6 +195,163 @@ build_baseline <- function(df, min_history = 5) {
 }
 
 # -----------------------------------------------------------------------------
+# 3b. DAILY & WEEKLY ANOMALY DETECTION
+# -----------------------------------------------------------------------------
+# The hourly detector above answers "was this hour abnormal?". These two
+# functions answer the same question at coarser resolutions -- "was this
+# whole day abnormal?" and "was this whole week abnormal?" -- using the same
+# leave-one-out baseline idea, just aggregated up first.
+
+# shared scoring helpers so daily/weekly severity uses the same 0-100 scale
+# and Normal/Low/Moderate/Critical bands as the hourly detector
+simple_severity_score <- function(z_score, deviation_pct, is_anomaly) {
+  z_component   <- pmin(abs(z_score) / 4, 1) * 60
+  dev_component <- pmin(abs(deviation_pct) / 100, 1) * 40
+  raw <- z_component + dev_component
+  if_else(is_anomaly, pmin(100, round(raw)), pmin(20, round(raw)))
+}
+
+severity_band_from_score <- function(score) {
+  case_when(
+    score <= 20 ~ "Normal",
+    score <= 40 ~ "Low",
+    score <= 70 ~ "Moderate",
+    TRUE        ~ "Critical"
+  )
+}
+
+#' Detect whole-day consumption anomalies. Baseline is computed per
+#' (building, day_type, season) using leave-one-day-out statistics, so a
+#' summer Tuesday is compared against other summer Tuesdays -- not against
+#' winter Tuesdays or weekends.
+#'
+#' @param df cleaned data (output of clean_energy_data)
+#' @return one row per building/date with total_kwh, expected_total,
+#'   z_score, deviation_pct, is_anomaly, anomaly_score, severity_band
+detect_daily_anomalies <- function(df, z_thresh = 2, dev_thresh = 25, min_history = 4) {
+
+  daily <- df %>%
+    group_by(building_id, date, day_type, season, wday_label) %>%
+    summarise(total_kwh = sum(consumption_kwh), .groups = "drop")
+
+  building_scale <- daily %>%
+    group_by(building_id) %>%
+    summarise(building_daily_mean = mean(total_kwh), .groups = "drop")
+
+  stats_by_group <- daily %>%
+    group_by(building_id, day_type, season) %>%
+    summarise(n = n(), group_mean = mean(total_kwh), group_sd = sd(total_kwh), .groups = "drop")
+
+  daily %>%
+    group_by(building_id, day_type, season) %>%
+    mutate(
+      n_cell       = n(),
+      sum_cell     = sum(total_kwh),
+      loo_mean_raw = if_else(n_cell > 1, (sum_cell - total_kwh) / (n_cell - 1), NA_real_),
+      loo_sd_raw   = { s <- sd(total_kwh); rep(s, n()) }
+    ) %>%
+    ungroup() %>%
+    left_join(stats_by_group, by = c("building_id", "day_type", "season")) %>%
+    left_join(building_scale, by = "building_id") %>%
+    mutate(
+      expected_total = if_else(!is.na(loo_mean_raw) & n_cell >= min_history, loo_mean_raw, group_mean),
+      expected_sd    = if_else(!is.na(loo_sd_raw) & loo_sd_raw > 0 & n_cell >= min_history,
+                                loo_sd_raw, pmax(group_sd, 0.05 * group_mean, 1e-6)),
+      z_score        = (total_kwh - expected_total) / expected_sd,
+      deviation_pct  = 100 * (total_kwh - expected_total) / pmax(expected_total, 1e-6),
+      min_abs_dev    = pmax(0.1, 0.05 * building_daily_mean),
+      meaningful     = abs(total_kwh - expected_total) >= min_abs_dev,
+      reliable_pct   = expected_total >= 0.15 * pmax(building_daily_mean, 1e-6),
+      z_flag         = abs(z_score) >= z_thresh & meaningful,
+      dev_flag       = abs(deviation_pct) >= dev_thresh & meaningful & reliable_pct,
+      is_anomaly     = z_flag | dev_flag,
+      direction      = if_else(total_kwh >= expected_total, "spike", "drop"),
+      anomaly_score  = simple_severity_score(z_score, deviation_pct, is_anomaly),
+      severity_band  = severity_band_from_score(anomaly_score)
+    ) %>%
+    select(building_id, date, day_type, season, wday_label, total_kwh,
+           expected_total, expected_sd, z_score, deviation_pct,
+           is_anomaly, direction, anomaly_score, severity_band)
+}
+
+#' Detect whole-week consumption anomalies. Baseline is each building's own
+#' history of weekly totals (leave-one-week-out), requiring a nearly-complete
+#' week of readings so partial weeks at the very start/end of the dataset
+#' aren't unfairly compared against full weeks.
+#'
+#' @param df cleaned data (output of clean_energy_data)
+#' @param min_hours minimum hours of data required within a week to score it
+#' @return one row per building/ISO-week with total_kwh, expected_total,
+#'   z_score, deviation_pct, is_anomaly, anomaly_score, severity_band
+detect_weekly_anomalies <- function(df, z_thresh = 2, dev_thresh = 25, min_history = 4, min_hours = 120) {
+
+  weekly <- df %>%
+    mutate(iso_year = isoyear(timestamp), iso_week = isoweek(timestamp)) %>%
+    group_by(building_id, iso_year, iso_week) %>%
+    summarise(
+      week_start = min(date),
+      total_kwh  = sum(consumption_kwh),
+      n_hours    = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n_hours >= min_hours)
+
+  stats_by_building <- weekly %>%
+    group_by(building_id) %>%
+    summarise(n = n(), group_mean = mean(total_kwh), group_sd = sd(total_kwh), .groups = "drop")
+
+  weekly %>%
+    group_by(building_id) %>%
+    mutate(
+      n_cell       = n(),
+      sum_cell     = sum(total_kwh),
+      loo_mean_raw = if_else(n_cell > 1, (sum_cell - total_kwh) / (n_cell - 1), NA_real_),
+      loo_sd_raw   = { s <- sd(total_kwh); rep(s, n()) }
+    ) %>%
+    ungroup() %>%
+    left_join(stats_by_building, by = "building_id") %>%
+    mutate(
+      expected_total = if_else(!is.na(loo_mean_raw) & n_cell >= min_history, loo_mean_raw, group_mean),
+      expected_sd    = if_else(!is.na(loo_sd_raw) & loo_sd_raw > 0 & n_cell >= min_history,
+                                loo_sd_raw, pmax(group_sd, 0.05 * group_mean, 1e-6)),
+      z_score        = (total_kwh - expected_total) / expected_sd,
+      deviation_pct  = 100 * (total_kwh - expected_total) / pmax(expected_total, 1e-6),
+      z_flag         = abs(z_score) >= z_thresh,
+      dev_flag       = abs(deviation_pct) >= dev_thresh,
+      is_anomaly     = z_flag | dev_flag,
+      direction      = if_else(total_kwh >= expected_total, "spike", "drop"),
+      anomaly_score  = simple_severity_score(z_score, deviation_pct, is_anomaly),
+      severity_band  = severity_band_from_score(anomaly_score)
+    ) %>%
+    select(building_id, iso_year, iso_week, week_start, total_kwh,
+           expected_total, expected_sd, z_score, deviation_pct,
+           is_anomaly, direction, anomaly_score, severity_band)
+}
+
+#' Plain-English explanation for a scored daily row (see detect_daily_anomalies).
+explain_daily_anomaly <- function(row) {
+  if (!isTRUE(row$is_anomaly)) {
+    return(sprintf("Total consumption on this %s was within the expected range for a %s %s in %s.",
+                    row$wday_label, row$day_type, row$wday_label, row$season))
+  }
+  dir_word <- if (row$direction == "spike") "higher" else "lower"
+  sprintf("Daily total was %.0f%% %s than expected for a %s %s in %s (%.1f\u03c3 %s expected level).",
+          abs(row$deviation_pct), dir_word, row$day_type, row$wday_label, row$season,
+          abs(row$z_score), if (row$direction == "spike") "above" else "below")
+}
+
+#' Plain-English explanation for a scored weekly row (see detect_weekly_anomalies).
+explain_weekly_anomaly <- function(row) {
+  if (!isTRUE(row$is_anomaly)) {
+    return("Weekly total consumption was within this building's normal historical range.")
+  }
+  dir_word <- if (row$direction == "spike") "higher" else "lower"
+  sprintf("Week of %s totaled %.0f%% %s than this building's typical week (%.1f\u03c3 %s expected level).",
+          format(row$week_start, "%b %d, %Y"), abs(row$deviation_pct), dir_word,
+          abs(row$z_score), if (row$direction == "spike") "above" else "below")
+}
+
+# -----------------------------------------------------------------------------
 # 4. ANOMALY DETECTION
 # -----------------------------------------------------------------------------
 #' Flag anomalies using z-score, IQR fence, and % deviation from baseline.

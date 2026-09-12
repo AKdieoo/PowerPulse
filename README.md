@@ -1,23 +1,31 @@
 # ⚡ PowerPulse — Electricity Consumption Anomaly Intelligence
 
 An R + Shiny app that doesn't just forecast electricity demand — it explains
-**why** today's consumption looks abnormal, with a dynamic per-hour baseline,
-statistical anomaly detection (z-score / IQR / % deviation), a 0–100 severity
-score, and an interactive dashboard.
+**why** consumption looks abnormal, at **three time resolutions**: hourly
+(operational spikes/drops against a dynamic per-hour baseline), daily
+("this Tuesday was 2.3σ above normal Tuesdays"), and weekly (trend-level
+drift against a building's own history) — each with statistical anomaly
+detection (z-score / IQR / % deviation), a shared 0–100 severity score, and
+an interactive dashboard.
 
 ```
 Energy Dataset → Data Cleaning → Consumption Profiling → Time-Series Analysis
-→ Baseline Generation → Anomaly Detection → Statistical Explanation
-→ Interactive Dashboard
+→ Multi-Resolution Baseline Generation (Hourly / Daily / Weekly)
+→ Anomaly Detection → Statistical Explanation → Interactive Dashboard
 ```
 
 ## Screenshots
 
-**Dashboard overview** — KPI cards, actual-vs-expected chart, and the
-detected anomalies table for a real household circuit (Water Heater & AC,
-from the UCI dataset above):
+**Dashboard overview** — KPI cards (including all-time anomalous day/week
+counts), actual-vs-expected chart, and the detected anomalies table for a
+real household circuit (Water Heater & AC, from the UCI dataset below):
 
 ![Dashboard overview](screenshots/dashboard-overview.png)
+
+**Trend-level anomaly detection** — the Daily/Weekly tabs surfacing
+flagged periods with a plain-English statistical explanation for each:
+
+![Trend-level anomalies](screenshots/trend-anomalies.png)
 
 **Anomaly detail panel** — clicking a row surfaces the severity score and
 the statistical "likely causes":
@@ -57,6 +65,7 @@ powerpulse/
 │   ├── generate_data.R   # creates a synthetic sample dataset (optional)
 │   ├── load_uci_data.R   # converts the real UCI dataset into PowerPulse's format
 │   └── pipeline.R        # cleaning, profiling, baseline, detection, scoring
+│                         # (hourly + daily + weekly resolutions)
 ├── data/
 │   └── energy_data.csv   # the real, processed hourly dataset used by the app
 └── README.md
@@ -92,6 +101,9 @@ Unzip `powerpulse.zip` anywhere, e.g. `~/Documents/powerpulse/`.
 1. Open RStudio → File → Open Project (or just open the `powerpulse` folder).
 2. Open `app.R`.
 3. Click the **Run App** button in the top-right of the editor pane.
+4. Click **"Open in Browser"** in the viewer toolbar rather than viewing it
+   in RStudio's built-in Viewer pane — the Viewer pane is short by design
+   and can make the page feel cramped; a real browser tab scrolls normally.
 
 **Option B — plain R console:**
 ```r
@@ -157,6 +169,8 @@ to keep only the most recent 12 months.
 
 ## 6. How the analytics work (`R/pipeline.R`)
 
+### Hourly resolution — operational spikes/drops
+
 1. **`clean_energy_data()`** — de-duplicates, coerces types, clips negative
    readings, linearly interpolates small gaps, and adds calendar features
    (hour, weekday/weekend, season, night-time flag).
@@ -164,7 +178,7 @@ to keep only the most recent 12 months.
    (top quartile of average hourly load, computed per building from its own
    data — not a hardcoded clock-time guess), weekday-vs-weekend and seasonal
    averages.
-3. **`build_baseline()`** — the *dynamic baseline*. For every
+3. **`build_baseline()`** — the *dynamic hourly baseline*. For every
    `(building, hour-of-day, weekday/weekend)` combination it computes a
    leave-one-day-out expected mean and standard deviation, so "Monday 8 AM"
    and "Saturday 8 AM" get genuinely different expectations instead of one
@@ -201,24 +215,67 @@ to keep only the most recent 12 months.
    regardless of what the circuit actually is. This is exactly the "Likely
    causes" list shown in the dashboard's detail panel.
 
-You can call these functions directly from a plain R script too (no Shiny
-required) — see the bottom of `R/pipeline.R` for `run_pipeline()`, which
-chains all of the above in one call.
+### Daily & weekly resolution — trend-level drift
+
+Real operational problems don't always show up as a single bad hour — a
+slow refrigerant leak or a stuck thermostat can look normal hour-by-hour
+while still pushing an entire day or week well above what's typical. These
+two functions answer that question at coarser resolutions, using the same
+leave-one-out baseline philosophy as the hourly detector, just aggregated up
+first:
+
+7. **`detect_daily_anomalies()`** — sums consumption per building per day,
+   then compares each day's total against a leave-one-day-out baseline
+   computed per `(building, day_type, season)` — so a summer Tuesday is
+   judged against other summer Tuesdays, not winter Tuesdays or weekends.
+   Flags via `|z-score| ≥ threshold` or `|% deviation| ≥ threshold`, with the
+   same near-zero-baseline guard as the hourly detector (a `reliable_pct`
+   check) plus a minimum-absolute-deviation floor so tiny noise on a
+   low-usage day doesn't register as a huge swing.
+8. **`detect_weekly_anomalies()`** — sums consumption per building per ISO
+   week, then compares each week's total against that specific building's
+   own leave-one-week-out history. Requires a near-complete week
+   (`min_hours`) before scoring it, so partial weeks at the very start/end
+   of the dataset aren't unfairly compared against full weeks.
+9. **`simple_severity_score()` / `severity_band_from_score()`** — shared
+   helpers so daily and weekly severity land on the **same 0–100 scale and
+   Normal/Low/Moderate/Critical bands** as the hourly detector, rather than
+   three separate scoring systems.
+10. **`explain_daily_anomaly()` / `explain_weekly_anomaly()`** — plain-English
+    explanations in the same spirit as `explain_anomaly()`, e.g. *"Daily
+    total was 34% higher than expected for a weekday Tuesday in Summer
+    (2.3σ above expected level)"* or *"Week of Jun 16, 2010 totaled 41%
+    higher than this building's typical week."*
+
+You can call any of these functions directly from a plain R script too (no
+Shiny required) — see the bottom of `R/pipeline.R` for `run_pipeline()`,
+which chains the hourly stages (1–6) in one call; the daily/weekly functions
+(7–8) can be called standalone on the output of `clean_energy_data()`.
 
 ## 7. Using the dashboard
 
 - **Sidebar:** pick a building and a date, and tune the anomaly sensitivity
-  (z-score / % deviation thresholds) live.
-- **Top KPI cards:** today's total kWh, anomaly count, peak hourly load, and
-  % deviation from the building's typical daily total.
-- **Actual vs Expected chart:** the dashed line + shaded band is the dynamic
-  baseline (±1σ); markers are actual readings, colored by severity, sized up
-  when anomalous.
-- **Detected Anomalies table:** each row shows an emoji tag matching its
-  anomaly type (🔥 spike, 📉 drop, 🌙 night, 📅 weekend, ⚡ peak-load, plus 🔁
-  if it's part of a repeated pattern). Click any row to open the **Anomaly
-  Detail** panel — score, band, z-score, % deviation, and the "likely
-  causes" list.
+  (z-score / % deviation thresholds) live. These same sliders drive **all
+  three resolutions** — hourly, daily, and weekly — so one control set
+  tunes the whole dashboard consistently.
+- **Top KPI cards:** today's total kWh, hourly anomaly count, peak hourly
+  load, % deviation from the building's typical daily total, plus two
+  all-time counters — **Anomalous Days** and **Anomalous Weeks** — for the
+  selected building.
+- **Actual vs Expected chart (Hourly):** the dashed line + shaded band is
+  the dynamic baseline (±1σ); markers are actual readings, colored by
+  severity, sized up when anomalous.
+- **Detected Anomalies table (Hourly):** each row shows an emoji tag
+  matching its anomaly type (🔥 spike, 📉 drop, 🌙 night, 📅 weekend, ⚡
+  peak-load, plus 🔁 if it's part of a repeated pattern). Click any row to
+  open the **Anomaly Detail** panel — score, band, z-score, % deviation, and
+  the "likely causes" list.
+- **Trend-Level Anomaly Detection (Daily & Weekly):** a tabbed card showing
+  every flagged day or week for the selected building — date/week, total
+  kWh, deviation %, z-score, severity, and a full plain-English explanation
+  per row. This is the "this Tuesday was 2.3σ above normal Tuesdays" and
+  "this week ran 40% hot" layer, sitting alongside the hourly view rather
+  than replacing it.
 - **Bottom charts:** weekday-vs-weekend, day-of-week, and seasonal
   (Winter/Spring/Summer/Autumn) profiling for the selected building.
 
@@ -233,9 +290,22 @@ rsconnect::deployApp("path/to/powerpulse")
 
 ## Troubleshooting
 
-- **"could not find function..."** → you're missing a package; re-run the
-  `install.packages(...)` line in step 2.
+- **"could not find function 'detect_daily_anomalies'" (or
+  `detect_weekly_anomalies`)** → `R/pipeline.R` on disk is out of date;
+  make sure the full file (including the "Daily & Weekly Anomaly Detection"
+  section) is saved, then restart R (Session → Restart R) before re-running
+  the app so old definitions don't linger in memory.
+- **"could not find function..." (other packages)** → you're missing a
+  package; re-run the `install.packages(...)` line in step 2.
 - **App opens but chart/table is blank** → check that `data/energy_data.csv`
   has more than one day of data per building (the baseline needs history).
+- **Page feels cramped with tiny internal scrollbars** → this happens in
+  RStudio's built-in Viewer pane, which is short by design. Click **"Open
+  in Browser"** to view the app in a normal browser tab instead.
+- **Very high anomaly counts for a "bursty" circuit (e.g. Kitchen)** — a
+  near-zero-baseline circuit can have high day-to-day variance even when
+  nothing's wrong, which inflates z-scores/% deviation more than on a
+  steadier circuit like Water Heater & AC. Compare across buildings before
+  assuming the sensitivity is miscalibrated.
 - **Want a fresh random sample dataset?** Delete `data/energy_data.csv` and
   restart the app (or `source("R/generate_data.R")`).
